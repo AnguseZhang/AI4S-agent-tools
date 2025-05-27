@@ -1,14 +1,20 @@
 import logging
 import os
+import glob
 from pathlib import Path
-from typing import Literal, Optional, Tuple, TypedDict
+from typing import Literal, Optional, Tuple, TypedDict, List, Dict
 
 import numpy as np
 import seekpath
-from ase import Atoms, io
+from ase import Atoms, io, units
 from ase.build import bulk, surface
 from ase.io import read, write
 from ase.optimize import BFGS
+from ase.md.npt import NPT
+from ase.md.nvtberendsen import NVTBerendsen
+from ase.md.velocitydistribution import (MaxwellBoltzmannDistribution,
+                                         Stationary, ZeroRotation)
+from ase.md.verlet import VelocityVerlet
 from deepmd.calculator import DP
 from dp.agent.server import CalculationMCPServer
 from phonopy import Phonopy
@@ -59,7 +65,14 @@ class BuildStructureResult(TypedDict):
     structure_file: Path
 
 
-def prim2conven(ase_atoms: Atoms) -> Atoms:
+class MDResult(TypedDict):
+    """Result of MD simulation"""
+    final_structure: Path
+    trajectory_files: List[Path]
+    log_file: Path
+
+
+def _prim2conven(ase_atoms: Atoms) -> Atoms:
     """
     Convert a primitive cell (ASE Atoms) to a conventional standard cell using pymatgen.
     Parameters:
@@ -138,7 +151,7 @@ def build_structure(
         if structure_type == 'bulk':
             atoms = bulk(material1, crystal_structure1, a=a1, b=b1, c=c1, alpha=alpha1)
             if conventional:
-                atoms = prim2conven(atoms)
+                atoms = _prim2conven(atoms)
 
         elif structure_type == 'surface':        
             bulk1 = bulk(material1, crystal_structure1, a=a1, b=b1, c=c1, alpha=alpha1)
@@ -154,8 +167,8 @@ def build_structure(
             bulk2 = bulk(material2, crystal_structure2,
                         a=a2, b=b2, c=c2, alpha=alpha2)
             if conventional:
-                bulk1 = prim2conven(bulk1)
-                bulk2 = prim2conven(bulk2)
+                bulk1 = _prim2conven(bulk1)
+                bulk2 = _prim2conven(bulk2)
             surf1 = surface(bulk1, miller_index1, layers1)
             surf2 = surface(bulk2, miller_index2, layers2)
             # Align surfaces along the stacking axis
@@ -399,6 +412,239 @@ def calculate_phonon(
             "band_dat": Path(""),
             "message": f"Calculation failed: {str(e)}"
         }
+
+def _log_progress(atoms, dyn):
+    """Log simulation progress"""
+    epot = atoms.get_potential_energy()
+    ekin = atoms.get_kinetic_energy()
+    temp = ekin / (1.5 * len(atoms) * units.kB)
+    logging.info(f"Step: {dyn.nsteps:6d}, E_pot: {epot:.3f} eV, T: {temp:.2f} K")
+
+def _run_md_stage(atoms, stage, save_interval_steps, traj_file, seed, stage_id):
+    """Run a single MD simulation stage"""
+    temperature_K = stage.get('temperature_K', None)
+    pressure = stage.get('pressure', None)
+    mode = stage['mode']
+    runtime_ps = stage['runtime_ps']
+    timestep_ps = stage.get('timestep', 0.0005)  # default: 0.5 fs
+    tau_t_ps = stage.get('tau_t', 0.01)         # default: 10 fs
+    tau_p_ps = stage.get('tau_p', 0.1)          # default: 100 fs
+
+    timestep_fs = timestep_ps * 1000  # convert to fs
+    total_steps = int(runtime_ps * 1000 / timestep_fs)
+
+    # Initialize velocities if first stage with temperature
+    if stage_id == 1 and temperature_K is not None:
+        MaxwellBoltzmannDistribution(atoms, temperature_K=temperature_K, 
+                                   rng=np.random.RandomState(seed))
+        Stationary(atoms)
+        ZeroRotation(atoms)
+
+    # Choose ensemble
+    if mode == 'NVT':
+        dyn = NVTBerendsen(
+            atoms,
+            timestep=timestep_fs * units.fs,
+            temperature_K=temperature_K,
+            taut=tau_t_ps * 1000 * units.fs
+        )
+    elif mode.startswith('NPT'):
+        if mode == 'NPT-aniso':
+            mask = np.eye(3, dtype=bool)
+        elif mode == 'NPT-tri':
+            mask = None
+        else:
+            raise ValueError(f"Unknown NPT mode: {mode}")
+
+        if pressure is None:
+            raise ValueError("Pressure must be specified for NPT simulations")
+
+        dyn = NPT(
+            atoms,
+            timestep=timestep_fs * units.fs,
+            temperature_K=temperature_K,
+            externalstress=pressure * units.GPa,
+            ttime=tau_t_ps * 1000 * units.fs,
+            pfactor=tau_p_ps * 1000 * units.fs,
+            mask=mask
+        )
+    elif mode == 'NVE':
+        dyn = VelocityVerlet(
+            atoms,
+            timestep=timestep_fs * units.fs
+        )
+    else:
+        raise ValueError(f"Unknown mode: {mode}")
+
+    # Prepare trajectory file
+    os.makedirs(os.path.dirname(traj_file), exist_ok=True)
+    if os.path.exists(traj_file):
+        os.remove(traj_file)
+
+    def _write_frame():
+        """Write current frame to trajectory"""
+        results = atoms.calc.results
+        energy = results.get("energy", atoms.get_potential_energy())
+        forces = results.get("forces", atoms.get_forces())
+        stress = results.get("stress", atoms.get_stress(voigt=False))
+
+        if np.isnan(energy).any() or np.isnan(forces).any() or np.isnan(stress).any():
+            raise ValueError("NaN detected in simulation outputs. Aborting trajectory write.")
+
+        new_atoms = atoms.copy()
+        new_atoms.info["energy"] = energy
+        new_atoms.arrays["force"] = forces
+        new_atoms.info["virial"] = -stress * atoms.get_volume()
+
+        write(traj_file, new_atoms, format="extxyz", append=True)
+
+    # Attach callbacks
+    dyn.attach(_write_frame, interval=save_interval_steps)
+    dyn.attach(lambda: _log_progress(atoms, dyn), interval=100)
+
+    logging.info(f"[Stage {stage_id}] Starting {mode} simulation: T={temperature_K} K"
+                 + (f", P={pressure} GPa" if pressure is not None else "")
+                 + f", steps={total_steps}, dt={timestep_ps} ps")
+
+    # Run simulation
+    dyn.run(total_steps)
+    logging.info(f"[Stage {stage_id}] Finished simulation. Trajectory saved to: {traj_file}\n")
+
+    return atoms
+
+def _run_md_pipeline(atoms, stages, save_interval_steps=100, traj_prefix='traj', seed=None):
+    """Run multiple MD stages sequentially"""
+    for i, stage in enumerate(stages):
+        mode = stage['mode']
+        T = stage.get('temperature_K', 'NA')
+        P = stage.get('pressure', 'NA')
+
+        tag = f"stage{i+1}_{mode}_{T}K"
+        if P != 'NA':
+            tag += f"_{P}GPa"
+        traj_file = os.path.join("trajs_files", f"{traj_prefix}_{tag}.extxyz")
+
+        atoms = _run_md_stage(
+            atoms=atoms,
+            stage=stage,
+            save_interval_steps=save_interval_steps,
+            traj_file=traj_file,
+            seed=seed,
+            stage_id=i + 1
+        )
+
+    return atoms
+
+@mcp.tool()
+def run_molecular_dynamics(
+    initial_structure: Path,
+    model_path: Path,
+    stages: List[Dict],
+    save_interval_steps: int = 100,
+    traj_prefix: str = 'traj',
+    seed: Optional[int] = 42,
+    model_head: str = "MP_traj_v024_alldata_mixu"
+) -> MDResult:
+    """
+    Run a multi-stage molecular dynamics simulation using Deep Potential.
+
+    This tool performs molecular dynamics simulations with different ensembles (NVT, NPT, NVE)
+    in sequence, using the ASE framework with the Deep Potential calculator.
+
+    Args:
+        initial_structure (Path): Input atomic structure file (supports .xyz, .cif, etc.)
+        model_path (Path): Path to the Deep Potential model file (.pt or .pb)
+        stages (List[Dict]): List of simulation stages. Each dictionary can contain:
+            - mode (str): Simulation ensemble type. One of:
+                * "NVT" - constant Number, Volume, Temperature
+                * "NPT-aniso" - constant Number, Pressure (anisotropic), Temperature
+                * "NPT-tri" - constant Number, Pressure (tri-axial), Temperature
+                * "NVE" - constant Number, Volume, Energy (no thermostat/barostat)
+            - runtime_ps (float): Simulation duration in picoseconds.
+            - temperature_K (float, optional): Temperature in Kelvin (required for NVT/NPT).
+            - pressure (float, optional): Pressure in GPa (required for NPT).
+            - timestep_ps (float, optional): Time step in picoseconds (default: 0.0005 ps = 0.5 fs).
+            - tau_t_ps (float, optional): Temperature coupling time in picoseconds (default: 0.01 ps).
+            - tau_p_ps (float, optional): Pressure coupling time in picoseconds (default: 0.1 ps).
+        save_interval_steps (int): Interval (in MD steps) to save trajectory frames (default: 100).
+        traj_prefix (str): Prefix for trajectory output files (default: 'traj').
+        seed (int, optional): Random seed for initializing velocities (default: 42).
+        model_head (str): Deep Potential model head name (default: "MP_traj_v024_alldata_mixu").
+
+    Returns:
+        MDResult: A dictionary containing:
+            - final_structure (Path): Final atomic structure after all stages.
+            - trajectory_files (List[Path]): List of trajectory files generated, one per stage.
+            - log_file (Path): Path to the log file containing simulation output.
+
+    Examples:
+        >>> stages = [
+        ...     {
+        ...         "mode": "NVT",
+        ...         "temperature_K": 300,
+        ...         "runtime_ps": 5,
+        ...         "timestep_ps": 0.0005,
+        ...         "tau_t_ps": 0.01
+        ...     },
+        ...     {
+        ...         "mode": "NPT-aniso",
+        ...         "temperature_K": 300,
+        ...         "pressure": 1.0,
+        ...         "runtime_ps": 5,
+        ...         "timestep_ps": 0.0005,
+        ...         "tau_t_ps": 0.01,
+        ...         "tau_p_ps": 0.1
+        ...     },
+        ...     {
+        ...         "mode": "NVE",
+        ...         "runtime_ps": 5,
+        ...         "timestep_ps": 0.0005
+        ...     }
+        ... ]
+
+        >>> result = run_molecular_dynamics(
+        ...     initial_structure=Path("input.xyz"),
+        ...     model_path=Path("model.pb"),
+        ...     stages=stages,
+        ...     save_interval_steps=50,
+        ...     traj_prefix="cu_relax",
+        ...     seed=42
+        ... )
+    """
+
+    # Create output directories
+    os.makedirs("trajs_files", exist_ok=True)
+    log_file = Path("md_simulation.log")
+    
+    # Read initial structure
+    atoms = read(initial_structure)
+    
+    # Setup calculator
+    model = DP(model=str(model_path), head=model_head)
+    atoms.calc = model
+    
+    # Run MD pipeline
+    final_atoms = _run_md_pipeline(
+        atoms=atoms,
+        stages=stages,
+        save_interval_steps=save_interval_steps,
+        traj_prefix=traj_prefix,
+        seed=seed
+    )
+    
+    # Save final structure
+    final_structure = Path("final_structure.xyz")
+    write(final_structure, final_atoms)
+    
+    # Collect trajectory files
+    trajectory_files = [Path(f) for f in glob.glob(f"trajs_files/{traj_prefix}_*.extxyz")]
+    
+    return {
+        "final_structure": final_structure,
+        "trajectory_files": trajectory_files,
+        "log_file": log_file
+    }
+
 
 
 if __name__ == "__main__":
